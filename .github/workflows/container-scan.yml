@@ -1,0 +1,199 @@
+name: Container Build & Security Scan
+
+# Demonstrates: container CI/CD pipeline with security gate
+# Skills shown: Docker multi-stage builds, Trivy CVE scanning, SARIF reporting,
+#               pipeline gating on severity thresholds — mirrors Iron Bank workflow
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Re-scan daily at 06:00 UTC — catches newly published CVEs against existing image
+    - cron: '0 6 * * *'
+
+env:
+  IMAGE_NAME: devsecops-pipeline-demo
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ── Stage 1: Build ────────────────────────────────────────────────────────
+  build:
+    name: Build Container Image
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # Buildx enables advanced build features: multi-arch, cache, build secrets
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          echo "tag=${{ env.IMAGE_NAME }}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Building image: ${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false           # Build only — push after scan passes
+          tags: ${{ steps.meta.outputs.tag }}
+          cache-from: type=gha  # GitHub Actions cache for faster rebuilds
+          cache-to: type=gha,mode=max
+          # Save image to Docker daemon for scanning
+          load: true
+
+      - name: Save image to tarball
+        run: |
+          docker save "${{ steps.meta.outputs.tag }}" -o /tmp/image.tar
+          echo "Image saved: $(du -sh /tmp/image.tar | cut -f1)"
+
+      - name: Upload image tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: /tmp/image.tar
+          retention-days: 1   # Short retention — security artifact, not for distribution
+
+  # ── Stage 2: Vulnerability Scan ───────────────────────────────────────────
+  scan:
+    name: Trivy Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      security-events: write   # Required to upload SARIF to GitHub Security tab
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download container image
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp/
+
+      - name: Load image from tarball
+        run: docker load -i /tmp/image.tar
+
+      - name: Run Trivy — full vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-tag }}
+          format: 'table'          # Human-readable output in logs
+          exit-code: '0'           # Don't fail here — fail in the gate step below
+          ignore-unfixed: true     # Only flag CVEs with available fixes
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+
+      - name: Run Trivy — SARIF report for GitHub Security tab
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'container-scan'
+
+      - name: Upload raw scan results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif-report
+          path: trivy-results.sarif
+
+  # ── Stage 3: Security Gate ────────────────────────────────────────────────
+  security-gate:
+    name: Security Gate (Block on CRITICAL CVEs)
+    runs-on: ubuntu-latest
+    needs: [build, scan]
+
+    steps:
+      - name: Download container image
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp/
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - name: FAIL pipeline if CRITICAL CVEs found
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-tag }}
+          format: 'table'
+          exit-code: '1'           # EXIT 1 = fail the pipeline
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL'     # Gate only on CRITICAL — HIGH tracked but not blocking
+
+      - name: Write security gate summary
+        if: always()
+        run: |
+          echo "## 🔒 Security Gate Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "| CRITICAL CVEs | ✅ None found |" >> $GITHUB_STEP_SUMMARY
+            echo "| Security gate | ✅ Passed — image cleared for push |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| CRITICAL CVEs | ❌ Found — see Security tab |" >> $GITHUB_STEP_SUMMARY
+            echo "| Security gate | ❌ BLOCKED — do not push image |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Full scan results (CRITICAL+HIGH+MEDIUM+LOW) available in the Security tab._" >> $GITHUB_STEP_SUMMARY
+
+  # ── Stage 4: Push (only on main, only after gate passes) ──────────────────
+  push:
+    name: Push to Registry
+    runs-on: ubuntu-latest
+    needs: security-gate
+    # Only push from main branch — PRs build and scan but never push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Download container image
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp/
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      # Uncomment and configure to push to a real registry:
+      # - name: Log in to GitHub Container Registry
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
+      #
+      # - name: Push image
+      #   run: |
+      #     docker tag ${{ needs.build.outputs.image-tag }} ghcr.io/${{ github.repository }}:latest
+      #     docker push ghcr.io/${{ github.repository }}:latest
+
+      - name: Confirm push stage reached
+        run: |
+          echo "✅ Image passed security gate and is cleared for registry push."
+          echo "Image: ${{ needs.build.outputs.image-tag }}"
+          echo "Configure registry credentials in repo secrets to enable actual push."
