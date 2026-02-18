@@ -67,16 +67,16 @@ Push to main / PR
 
 ```bash
 # Build the image
-docker build -t devsecops-demo:local .
+docker build -t secure-build-pipeline:local .
 
 # Run the app
-docker run -p 8080:8080 devsecops-demo:local
+docker run -p 8080:8080 secure-build-pipeline:local
 
 # Health check
 curl http://localhost:8080/health
 
 # Scan locally with Trivy (install: https://aquasecurity.github.io/trivy)
-trivy image devsecops-demo:local
+trivy image secure-build-pipeline:local
 ```
 
 ## Skills Demonstrated
