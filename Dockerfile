@@ -1,7 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Hardened Python Container
-# Follows container security best practices informed by Platform One / Iron Bank
-# standards. Designed for vulnerability scanning with Trivy.
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Stage 1: Base — pin exact digest for supply-chain security
@@ -40,7 +39,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 FROM base AS final
 
 # Label metadata — good practice for image tracking in registries
-LABEL org.opencontainers.image.title="devsecops-demo" \
+LABEL org.opencontainers.image.title="contq" \
       org.opencontainers.image.description="DevSecOps pipeline demonstration app" \
       org.opencontainers.image.source="https://github.com/foo-mi/devsecops-pipeline-demo"
 
